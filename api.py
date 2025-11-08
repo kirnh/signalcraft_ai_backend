@@ -6,24 +6,36 @@ Provides endpoints for entities, news, and sentiment analysis.
 import os
 import json
 import logging
+import asyncio
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from main import (
     entity_enrichment_agent,
     single_article_sentiment_agent,
     reset_tool_call_counter,
-    Runner
+    Runner,
+    single_entity_news_agent,
+    MAX_CONCURRENT_NEWS_AGENTS,
+    MAX_CONCURRENT_SENTIMENT_AGENTS,
+    MAX_ENTITIES,
+    MAX_NEWS_PER_ENTITY,
+    MAX_RETRIES
 )
 from schemas import (
     EntityEnrichmentOutput,
     SingleArticleSentimentOutput,
-    RelatedEntity
+    RelatedEntity,
+    SingleEntityNewsOutput,
+    EntityWithNews,
+    NewsArticle
 )
 from tools import _get_entity_news_internal as get_entity_news
 import time
+import re
 
 # Load environment variables
 load_dotenv()
@@ -294,6 +306,322 @@ async def get_signals(company: str, entity: str, article: str, max: int = 10):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ============================================================================
+# STREAMING ENDPOINT WITH LOADING INDICATORS
+# ============================================================================
+
+def format_sse(data: dict, event: str = None) -> str:
+    """Format data as Server-Sent Event."""
+    msg = f"data: {json.dumps(data)}\n\n"
+    if event:
+        msg = f"event: {event}\n{msg}"
+    return msg
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Check if error is a rate limit error."""
+    error_str = str(error)
+    return "429" in error_str or "rate_limit" in error_str.lower() or "rate limit" in error_str.lower()
+
+
+def extract_retry_after(error_message: str) -> float:
+    """Extract retry-after time from error message."""
+    match = re.search(r'(?:try again in|retry_after[:\s]+)(\d+\.?\d*)\s*s', error_message, re.IGNORECASE)
+    if match:
+        return float(match.group(1))
+    return None
+
+
+@app.get("/api/stream")
+async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 10):
+    """
+    Stream complete trading signals analysis with loading indicators.
+    Returns Server-Sent Events (SSE) with progressive updates.
+    
+    Args:
+        company: Company name to analyze
+        max_entities: Maximum number of entities (default: 10)
+        max_news: Maximum news articles per entity (default: 10)
+        
+    Returns:
+        SSE stream with events:
+        - entity: New entity discovered (with isLoadingNews: true)
+        - entity_update: Entity news loaded (with isLoadingNews: false)
+        - article_update: Article signals ready (with isLoading: false)
+        - complete: Analysis finished
+        - error: Error occurred
+        
+    Example:
+        GET /api/stream?company=Apple&max_entities=10&max_news=10
+        
+    Response (SSE stream):
+        data: {"type": "entity", "data": {"entity_name": "Samsung", "isLoadingNews": true, ...}}
+        
+        data: {"type": "entity_update", "data": {"entity_name": "Samsung", "isLoadingNews": false, ...}}
+        
+        data: {"type": "article_update", "data": {"entity_name": "Samsung", "article_url": "...", "isLoading": false, ...}}
+        
+        data: {"type": "complete"}
+    """
+    if not company:
+        raise HTTPException(status_code=400, detail="company parameter is required")
+    
+    async def generate_events():
+        try:
+            logger.info(f"Starting streaming analysis for {company}")
+            
+            # Reset tool call counters
+            reset_tool_call_counter()
+            
+            # Step 1: Entity Enrichment
+            yield format_sse({"type": "status", "message": "Finding related entities..."})
+            
+            runner = Runner()
+            enrichment_result = await runner.run(
+                entity_enrichment_agent,
+                input=json.dumps({"company_name": company})
+            )
+            
+            enrichment_data = enrichment_result.final_output_as(EntityEnrichmentOutput)
+            
+            # Add self company entity
+            enrichment_data.entities.append(
+                RelatedEntity(
+                    entity_name=company,
+                    relationship_strength=1.0,
+                    relationship_type="self"
+                )
+            )
+            
+            # Enforce max limit
+            if len(enrichment_data.entities) > max_entities:
+                self_entity = [e for e in enrichment_data.entities if e.relationship_type == "self"]
+                other_entities = [e for e in enrichment_data.entities if e.relationship_type != "self"]
+                other_entities.sort(key=lambda x: x.relationship_strength, reverse=True)
+                enrichment_data.entities = other_entities[:max_entities-1] + self_entity
+            
+            logger.info(f"Found {len(enrichment_data.entities)} entities")
+            
+            # Emit entities with loading state
+            for entity in enrichment_data.entities:
+                yield format_sse({
+                    "type": "entity",
+                    "data": {
+                        "entity_name": entity.entity_name,
+                        "relationship_strength": entity.relationship_strength,
+                        "relationship_type": entity.relationship_type,
+                        "isLoadingNews": True,
+                        "newsArticles": []
+                    }
+                })
+            
+            # Step 2: News Aggregation (parallel)
+            yield format_sse({"type": "status", "message": f"Fetching news for {len(enrichment_data.entities)} entities..."})
+            
+            news_semaphore = asyncio.Semaphore(MAX_CONCURRENT_NEWS_AGENTS)
+            
+            async def process_entity_news_stream(entity: RelatedEntity):
+                """Process news for a single entity and emit updates."""
+                async with news_semaphore:
+                    single_entity_input = {
+                        "company_name": company,
+                        "entity": {
+                            "entity_name": entity.entity_name,
+                            "relationship_strength": entity.relationship_strength,
+                            "relationship_type": entity.relationship_type
+                        }
+                    }
+                    
+                    # Retry logic
+                    last_error = None
+                    for attempt in range(MAX_RETRIES + 1):
+                        try:
+                            runner = Runner()
+                            result = await runner.run(
+                                single_entity_news_agent,
+                                input=json.dumps(single_entity_input)
+                            )
+                            
+                            single_result = result.final_output_as(SingleEntityNewsOutput)
+                            
+                            # Limit news articles
+                            if len(single_result.entity.news) > max_news:
+                                single_result.entity.news = single_result.entity.news[:max_news]
+                            
+                            # Emit entity update with news (articles have isLoading: true)
+                            news_articles = [
+                                {
+                                    "url": article.url,
+                                    "title": article.title,
+                                    "source": article.source,
+                                    "published_date": article.published_date,
+                                    "isLoading": True,
+                                    "signals": []
+                                }
+                                for article in single_result.entity.news
+                            ]
+                            
+                            return {
+                                "entity_name": entity.entity_name,
+                                "relationship_strength": entity.relationship_strength,
+                                "relationship_type": entity.relationship_type,
+                                "isLoadingNews": False,
+                                "newsArticles": news_articles
+                            }, single_result.entity
+                            
+                        except Exception as e:
+                            last_error = e
+                            if is_rate_limit_error(e) and attempt < MAX_RETRIES:
+                                retry_after = extract_retry_after(str(e))
+                                wait_time = retry_after * 1.1 if retry_after else (2 ** attempt) + (attempt * 0.5)
+                                logger.warning(f"Rate limit for {entity.entity_name}, waiting {wait_time:.2f}s")
+                                await asyncio.sleep(wait_time)
+                            else:
+                                break
+                    
+                    # Failed - return empty
+                    logger.error(f"Failed to fetch news for {entity.entity_name}: {last_error}")
+                    return {
+                        "entity_name": entity.entity_name,
+                        "relationship_strength": entity.relationship_strength,
+                        "relationship_type": entity.relationship_type,
+                        "isLoadingNews": False,
+                        "newsArticles": []
+                    }, None
+            
+            # Process all entities in parallel
+            entity_tasks = [process_entity_news_stream(entity) for entity in enrichment_data.entities]
+            entity_results = await asyncio.gather(*entity_tasks, return_exceptions=True)
+            
+            # Emit entity updates and collect articles for sentiment analysis
+            articles_to_process = []
+            
+            for result in entity_results:
+                if isinstance(result, Exception):
+                    logger.error(f"Entity task failed: {result}")
+                    continue
+                
+                entity_update, entity_with_news = result
+                
+                # Emit entity update
+                yield format_sse({
+                    "type": "entity_update",
+                    "data": entity_update
+                })
+                
+                # Collect articles for sentiment processing
+                if entity_with_news and entity_with_news.news:
+                    for article in entity_with_news.news:
+                        articles_to_process.append({
+                            "entity_name": entity_with_news.entity_name,
+                            "relationship_strength": entity_with_news.relationship_strength,
+                            "relationship_type": entity_with_news.relationship_type,
+                            "article": article
+                        })
+            
+            # Step 3: Sentiment Analysis (parallel)
+            if articles_to_process:
+                yield format_sse({"type": "status", "message": f"Analyzing {len(articles_to_process)} articles..."})
+                
+                sentiment_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SENTIMENT_AGENTS)
+                
+                async def process_article_sentiment_stream(article_data: dict):
+                    """Process sentiment for a single article and emit update."""
+                    async with sentiment_semaphore:
+                        entity_name = article_data["entity_name"]
+                        article = article_data["article"]
+                        
+                        single_article_input = {
+                            "company_name": company,
+                            "entity_name": entity_name,
+                            "relationship_strength": article_data["relationship_strength"],
+                            "relationship_type": article_data["relationship_type"],
+                            "article": {
+                                "url": article.url,
+                                "title": article.title,
+                                "source": article.source,
+                                "published_date": article.published_date
+                            }
+                        }
+                        
+                        # Retry logic
+                        last_error = None
+                        for attempt in range(MAX_RETRIES + 1):
+                            try:
+                                runner = Runner()
+                                result = await runner.run(
+                                    single_article_sentiment_agent,
+                                    input=json.dumps(single_article_input)
+                                )
+                                
+                                single_result = result.final_output_as(SingleArticleSentimentOutput)
+                                
+                                # Emit article update with signals
+                                return {
+                                    "entity_name": entity_name,
+                                    "article_url": article.url,
+                                    "article_title": article.title,
+                                    "isLoading": False,
+                                    "signals": [
+                                        {
+                                            "token_text": token.token_text,
+                                            "impact": token.impact,
+                                            "direction": token.direction,
+                                            "strength": token.strength
+                                        }
+                                        for token in single_result.article.sentiment_tokens
+                                    ]
+                                }
+                                
+                            except Exception as e:
+                                last_error = e
+                                if is_rate_limit_error(e) and attempt < MAX_RETRIES:
+                                    retry_after = extract_retry_after(str(e))
+                                    wait_time = retry_after * 1.1 if retry_after else (2 ** attempt) + (attempt * 0.5)
+                                    logger.warning(f"Rate limit for article, waiting {wait_time:.2f}s")
+                                    await asyncio.sleep(wait_time)
+                                else:
+                                    break
+                        
+                        # Failed - return empty signals
+                        logger.error(f"Failed to analyze article {article.url}: {last_error}")
+                        return {
+                            "entity_name": entity_name,
+                            "article_url": article.url,
+                            "article_title": article.title,
+                            "isLoading": False,
+                            "signals": []
+                        }
+                
+                # Process all articles in parallel
+                article_tasks = [process_article_sentiment_stream(data) for data in articles_to_process]
+                article_results = await asyncio.gather(*article_tasks, return_exceptions=True)
+                
+                # Emit article updates
+                for result in article_results:
+                    if isinstance(result, Exception):
+                        logger.error(f"Article task failed: {result}")
+                        continue
+                    
+                    yield format_sse({
+                        "type": "article_update",
+                        "data": result
+                    })
+            
+            # Complete
+            yield format_sse({"type": "complete", "message": "Analysis complete"})
+            logger.info(f"Completed streaming analysis for {company}")
+            
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            yield format_sse({
+                "type": "error",
+                "message": str(e)
+            })
+    
+    return StreamingResponse(generate_events(), media_type="text/event-stream")
+
+
 if __name__ == "__main__":
     import uvicorn
     
@@ -309,6 +637,9 @@ if __name__ == "__main__":
     print(f"  GET  /api/entities?company=Apple&max=10")
     print(f"  GET  /api/news?company=Apple&entity=Samsung&max=10")
     print(f"  GET  /api/signals?company=Apple&entity=Samsung&article=https://...&max=10")
+    print(f"\n📡 Streaming Endpoint (with loading indicators):")
+    print(f"  GET  /api/stream?company=Apple&max_entities=10&max_news=10")
+    print(f"       Returns SSE stream with progressive updates")
     print(f"\n🏥 Health:")
     print(f"  GET  /health")
     print(f"\n💡 Ready for frontend integration!")
