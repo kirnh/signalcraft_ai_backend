@@ -1,0 +1,13 @@
+[project]
+name = "openai-agents-sdk-trader-signals"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai-agents>=0.5.0",
+    "requests>=2.31.0",
+    "beautifulsoup4>=4.12.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+]
