@@ -130,32 +130,213 @@ All logs include **timestamps**, **module names**, and **log levels** for easy d
 
 ## Usage
 
-### Basic Usage
+### 🚀 REST API (For Frontend Integration)
 
-Import `run_trading_signal_pipeline` from `main` and call it asynchronously with a company name. The function returns a structured result with all analysis data.
+The system includes a **FastAPI-based REST API** with granular endpoints for fetching entities, news, and sentiment analysis. This approach gives your frontend full control over progressive loading and caching.
 
-### Run the Complete Pipeline
+#### Starting the API Server
+
+```bash
+python api.py
+```
+
+The API server will start on `http://localhost:8000` (configurable via `HOST` and `PORT` environment variables).
+
+#### API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/health` | GET | Health check and API status |
+| `/api/entities` | GET | Get related entities for a company |
+| `/api/news` | GET | Get news articles for a specific entity |
+| `/api/signals` | GET | Get sentiment signals for a specific article |
+
+#### Endpoint Details
+
+**GET /api/entities**
+
+Fetches related entities for a company.
+
+```bash
+curl "http://localhost:8000/api/entities?company=Apple&max=10"
+```
+
+Response:
+```json
+[
+  {
+    "entity_name": "Samsung",
+    "relationship_strength": 0.85,
+    "relationship_type": "competitor"
+  },
+  {
+    "entity_name": "TSMC",
+    "relationship_strength": 0.92,
+    "relationship_type": "supplier"
+  }
+]
+```
+
+**GET /api/news**
+
+Fetches news articles for a specific entity.
+
+```bash
+curl "http://localhost:8000/api/news?company=Apple&entity=Samsung&max=10"
+```
+
+Response:
+```json
+[
+  {
+    "url": "https://reuters.com/article/samsung-chip",
+    "title": "Samsung announces new 3nm chip production",
+    "source": "Reuters",
+    "published_date": "2024-11-08"
+  }
+]
+```
+
+**GET /api/signals**
+
+Fetches sentiment signals for a specific article.
+
+```bash
+curl "http://localhost:8000/api/signals?company=Apple&entity=Samsung&article=https://...&max=10"
+```
+
+Response:
+```json
+[
+  {
+    "token_text": "Samsung announces 30% production increase",
+    "impact": "positive",
+    "direction": "bullish",
+    "strength": 0.85
+  }
+]
+```
+
+#### Frontend Integration Example
+
+**TypeScript/JavaScript:**
+
+```typescript
+const API_BASE_URL = 'http://localhost:8000';
+
+// Fetch entities
+const response = await fetch(
+  `${API_BASE_URL}/api/entities?company=${encodeURIComponent('Apple')}&max=10`
+);
+const entities = await response.json();
+
+// Fetch news for an entity
+const newsResponse = await fetch(
+  `${API_BASE_URL}/api/news?company=Apple&entity=${encodeURIComponent('Samsung')}&max=10`
+);
+const news = await newsResponse.json();
+
+// Fetch signals for an article
+const signalsResponse = await fetch(
+  `${API_BASE_URL}/api/signals?company=Apple&entity=Samsung&article=${encodeURIComponent(articleUrl)}&max=10`
+);
+const signals = await signalsResponse.json();
+```
+
+**Progressive Loading Pattern:**
+
+```typescript
+// Load entities first (fast)
+const entities = await api.getEntities(company, maxEntities);
+setEntities(entities); // User sees entities immediately!
+
+// Then load news progressively
+for (const entity of entities) {
+  await new Promise(resolve => setTimeout(resolve, 100)); // Smooth animation
+  const news = await api.getNews(company, entity.entity_name, maxNews);
+  setEntityNews(entity, news); // News appears one entity at a time
+}
+
+// Load signals on-demand when user clicks an article
+const signals = await api.getSignals(company, entity, article.url, maxSignals);
+```
+
+#### CORS Configuration
+
+The API includes CORS middleware configured to accept requests from any origin (development mode). For production, update the `allow_origins` in `api.py` to specify your frontend URL:
+
+```python
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://your-frontend-domain.com"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
+
+### 📦 Batch Processing (Python Script)
+
+For batch processing or testing, you can use the Python script directly.
+
+#### Run the Complete Pipeline
 
 Run `python main.py` to execute the complete pipeline. This will:
 1. Analyze the target company (default: Apple)
 2. Find related entities
 3. Fetch news for each entity
 4. Perform sentiment analysis
-5. Save results to a JSON file
+5. Save results to JSON files
 
-### Using Individual Agents
+#### Basic Usage
 
-You can use individual agents by importing them from `main` and using the `Runner` class. Create a Runner instance, call `run()` with the agent and input data, then access the structured output using `final_output_as()` with the appropriate schema class.
+Import `run_trading_signal_pipeline` from `main` and call it asynchronously with a company name:
+
+```python
+import asyncio
+from main import run_trading_signal_pipeline
+
+async def main():
+    result = await run_trading_signal_pipeline("Apple")
+    print(f"Found {len(result.entities)} entities")
+    print(f"Total sentiment signals: {sum(len(a.sentiment_tokens) for e in result.entities for a in e.news)}")
+
+asyncio.run(main())
+```
+
+#### Using Individual Agents
+
+You can use individual agents by importing them from `main` and using the `Runner` class:
+
+```python
+import asyncio
+from agents import Runner
+from main import entity_enrichment_agent
+from schemas import EntityEnrichmentOutput
+
+async def main():
+    runner = Runner()
+    result = await runner.run(
+        entity_enrichment_agent,
+        input='{"company_name": "Tesla"}'
+    )
+    enrichment_data = result.final_output_as(EntityEnrichmentOutput)
+    print(f"Found entities: {[e.entity_name for e in enrichment_data.entities]}")
+
+asyncio.run(main())
+```
 
 ## Project Structure
 
 The project contains:
-- `main.py`: Main pipeline and agent initialization
+- `main.py`: Main pipeline and agent initialization (batch processing)
+- `api.py`: **FastAPI REST API server** (for frontend integration)
 - `prompts.py`: Agent instructions and configurations
 - `tools.py`: Tool functions for agents
 - `schemas.py`: Pydantic schemas for structured outputs
 - `pyproject.toml`: Dependencies
 - `README.md`: This file (full documentation)
+- `ARCHITECTURE.md`: System architecture and data flow
 
 ## Tool-to-Agent Mapping
 

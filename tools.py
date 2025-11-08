@@ -123,11 +123,10 @@ def _fetch_news_newsapi(entity_name: str, num_results: int = 10) -> list:
     return formatted_articles
 
 
-@function_tool
-def get_entity_news(entity_name: str, num_results: int = None) -> str:
+def _get_entity_news_internal(entity_name: str, num_results: int = None) -> str:
     """
-    Fetch news articles for an entity using a configurable news API (GNews or NewsAPI).
-    Configure via NEWS_API_PROVIDER environment variable ('gnews' or 'newsapi').
+    Internal function to fetch news articles for an entity.
+    This is the actual implementation that can be called directly.
     
     Args:
         entity_name: Name of the entity to fetch news for
@@ -163,6 +162,22 @@ def get_entity_news(entity_name: str, num_results: int = None) -> str:
         logger.error(f"Error fetching news for '{entity_name}' using {NEWS_API_PROVIDER}: {e}", exc_info=True)
         print(f"Error fetching news: {e}")
         return json.dumps([])
+
+
+@function_tool
+def get_entity_news(entity_name: str, num_results: int = None) -> str:
+    """
+    Fetch news articles for an entity using a configurable news API (GNews or NewsAPI).
+    Configure via NEWS_API_PROVIDER environment variable ('gnews' or 'newsapi').
+    
+    Args:
+        entity_name: Name of the entity to fetch news for
+        num_results: Number of articles to fetch (default: uses MAX_NEWS_PER_ENTITY env var, defaults to 10)
+        
+    Returns:
+        JSON string containing news articles with url, published_date, source, title, description
+    """
+    return _get_entity_news_internal(entity_name, num_results)
 
 
 @function_tool
