@@ -133,6 +133,15 @@ class SingleArticleSentimentOutput(BaseModel):
     article: NewsArticle = Field(description="Single news article with sentiment tokens")
 
 
+# Input Validation Schema
+class InputValidationOutput(BaseModel):
+    """Output schema for Input Validation Agent."""
+    is_valid: bool = Field(description="Whether the input is about a single company or stock")
+    input_text: str = Field(description="The original input text being validated")
+    detected_entity: str = Field(description="The company or stock name detected, or empty string if invalid")
+    reason: str = Field(description="Reason for validation result - explanation of why it's valid or invalid")
+
+
 # Example usage and validation
 if __name__ == "__main__":
     # Test the schemas

@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import time
+from typing import Tuple
 from dotenv import load_dotenv
 from agents import Agent, Runner
 from tools import get_entity_news, fetch_article_content, reset_tool_call_counter
@@ -12,7 +13,8 @@ from prompts import (
     news_aggregation_agent_config,
     sentiment_analysis_agent_config,
     single_entity_news_agent_config,
-    single_article_sentiment_agent_config
+    single_article_sentiment_agent_config,
+    input_validation_agent_config
 )
 from schemas import (
     EntityEnrichmentOutput, 
@@ -24,7 +26,8 @@ from schemas import (
     EntityWithNews,
     EntityWithSentiment,
     NewsArticle,
-    NewsArticleBasic
+    NewsArticleBasic,
+    InputValidationOutput
 )
 
 # Load environment variables from .env file
@@ -113,6 +116,55 @@ single_article_sentiment_agent = Agent(
     model="gpt-4o",
     output_type=single_article_sentiment_agent_config["output_type"]
 )
+
+# Create input validation agent
+input_validation_agent = Agent(
+    name="Input Validation Agent",
+    instructions=input_validation_agent_config["instructions"],
+    tools=[],  # No tools needed for validation
+    model="gpt-4o",
+    output_type=input_validation_agent_config["output_type"]
+)
+
+
+async def validate_company_input(input_text: str) -> Tuple[bool, str, str]:
+    """
+    Validate if the input is about a single company or stock.
+    
+    Args:
+        input_text: The user input to validate
+        
+    Returns:
+        Tuple of (is_valid: bool, detected_entity: str, error_message: str)
+        - is_valid: True if input is about a single company/stock, False otherwise
+        - detected_entity: The detected company/stock name if valid, empty string otherwise
+        - error_message: Error message if invalid, empty string if valid
+    """
+    if not input_text or not input_text.strip():
+        return False, "", "Please specify a company or stock to analyze."
+    
+    try:
+        logger.info(f"Validating input: {input_text}")
+        runner = Runner()
+        validation_result = await runner.run(
+            input_validation_agent,
+            input=json.dumps({"input_text": input_text.strip()})
+        )
+        
+        validation_data = validation_result.final_output_as(InputValidationOutput)
+        
+        if validation_data.is_valid:
+            logger.info(f"✓ Input validated: {validation_data.detected_entity}")
+            return True, validation_data.detected_entity, ""
+        else:
+            error_msg = f"Please specify a single company or stock to analyze. {validation_data.reason}"
+            logger.warning(f"✗ Input validation failed: {validation_data.reason}")
+            return False, "", error_msg
+            
+    except Exception as e:
+        logger.error(f"Error during validation: {e}", exc_info=True)
+        # On validation error, be permissive but log the issue
+        return True, input_text.strip(), ""
 
 
 async def run_trading_signal_pipeline(company_name: str):

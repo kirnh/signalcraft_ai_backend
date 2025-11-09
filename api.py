@@ -23,7 +23,8 @@ from main import (
     MAX_CONCURRENT_SENTIMENT_AGENTS,
     MAX_ENTITIES,
     MAX_NEWS_PER_ENTITY,
-    MAX_RETRIES
+    MAX_RETRIES,
+    validate_company_input
 )
 from schemas import (
     EntityEnrichmentOutput,
@@ -114,10 +115,30 @@ async def get_entities(company: str, max: int = 10):
         ]
     """
     if not company:
-        raise HTTPException(status_code=400, detail="company parameter is required")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_failed",
+                "message": "company parameter is required"
+            }
+        )
+    
+    # Validate that input is about a single company or stock
+    is_valid, detected_entity, error_message = await validate_company_input(company)
+    if not is_valid:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_failed",
+                "message": error_message
+            }
+        )
+    
+    # Use detected entity if available, otherwise use original input
+    company_to_use = detected_entity if detected_entity else company
     
     try:
-        logger.info(f"Fetching entities for {company} (max={max})")
+        logger.info(f"Fetching entities for {company_to_use} (max={max})")
         
         # Reset tool call counters
         reset_tool_call_counter()
@@ -126,7 +147,7 @@ async def get_entities(company: str, max: int = 10):
         runner = Runner()
         enrichment_result = await runner.run(
             entity_enrichment_agent,
-            input=json.dumps({"company_name": company})
+            input=json.dumps({"company_name": company_to_use})
         )
         
         enrichment_data = enrichment_result.final_output_as(EntityEnrichmentOutput)
@@ -134,7 +155,7 @@ async def get_entities(company: str, max: int = 10):
         # Add self company entity
         enrichment_data.entities.append(
             RelatedEntity(
-                entity_name=company,
+                entity_name=company_to_use,
                 relationship_strength=1.0,
                 relationship_type="self"
             )
@@ -157,11 +178,14 @@ async def get_entities(company: str, max: int = 10):
             for entity in enrichment_data.entities
         ]
         
-        logger.info(f"Found {len(entities)} entities for {company}")
+        logger.info(f"Found {len(entities)} entities for {company_to_use}")
         return entities
         
+    except HTTPException:
+        # Re-raise HTTP exceptions (like validation errors)
+        raise
     except Exception as e:
-        logger.error(f"Error fetching entities for {company}: {e}", exc_info=True)
+        logger.error(f"Error fetching entities for {company_to_use}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -364,11 +388,30 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
         data: {"type": "complete"}
     """
     if not company:
-        raise HTTPException(status_code=400, detail="company parameter is required")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_failed",
+                "message": "company parameter is required"
+            }
+        )
     
     async def generate_events():
         try:
-            logger.info(f"Starting streaming analysis for {company}")
+            # Validate that input is about a single company or stock
+            is_valid, detected_entity, error_message = await validate_company_input(company)
+            if not is_valid:
+                yield format_sse({
+                    "type": "error",
+                    "error": "validation_failed",
+                    "message": error_message
+                })
+                return
+            
+            # Use detected entity if available, otherwise use original input
+            company_to_use = detected_entity if detected_entity else company
+            
+            logger.info(f"Starting streaming analysis for {company_to_use}")
             
             # Reset tool call counters
             reset_tool_call_counter()
@@ -379,7 +422,7 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
             runner = Runner()
             enrichment_result = await runner.run(
                 entity_enrichment_agent,
-                input=json.dumps({"company_name": company})
+                input=json.dumps({"company_name": company_to_use})
             )
             
             enrichment_data = enrichment_result.final_output_as(EntityEnrichmentOutput)
@@ -387,7 +430,7 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
             # Add self company entity
             enrichment_data.entities.append(
                 RelatedEntity(
-                    entity_name=company,
+                    entity_name=company_to_use,
                     relationship_strength=1.0,
                     relationship_type="self"
                 )
@@ -424,7 +467,7 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
                 """Process news for a single entity and emit updates."""
                 async with news_semaphore:
                     single_entity_input = {
-                        "company_name": company,
+                        "company_name": company_to_use,
                         "entity": {
                             "entity_name": entity.entity_name,
                             "relationship_strength": entity.relationship_strength,
@@ -532,7 +575,7 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
                         article = article_data["article"]
                         
                         single_article_input = {
-                            "company_name": company,
+                            "company_name": company_to_use,
                             "entity_name": entity_name,
                             "relationship_strength": article_data["relationship_strength"],
                             "relationship_type": article_data["relationship_type"],
@@ -610,7 +653,7 @@ async def stream_analysis(company: str, max_entities: int = 10, max_news: int = 
             
             # Complete
             yield format_sse({"type": "complete", "message": "Analysis complete"})
-            logger.info(f"Completed streaming analysis for {company}")
+            logger.info(f"Completed streaming analysis for {company_to_use}")
             
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
