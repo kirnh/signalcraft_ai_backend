@@ -1,4 +1,4 @@
-# AI Trading Signals - Multi-Agent System
+# SignalCraft AI - Multi-Agent trading signals generator
 
 A multi-agent system using OpenAI's Agents SDK to analyze trading signals by enriching company data, aggregating news, and performing sentiment analysis on related entities.
 
